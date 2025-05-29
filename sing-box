@@ -2,10 +2,10 @@
 
 # Sing-box Shadowsocks 服务端一键安装脚本
 # 作者：Ellery
-# 版本：1.4
+# 版本：1.5
 # 日期：2025年5月29日
 # 描述：自动化安装 sing-box 并配置为 Shadowsocks 服务端，支持内置混淆，自动生成密码，并配置防火墙。
-# 更新：默认混淆方式改为 HTTP 混淆，默认加密方式改为 2022-blake3-aes-128-gcm。
+# 更新：修复 SS 链接生成逻辑，退回至兼容性更好的版本。默认混淆方式为 HTTP，默认加密方式为 2022-blake3-aes-128-gcm。
 
 # --- 变量定义 ---
 SINGBOX_VERSION="latest" # 可以指定版本，例如 "1.8.0"
@@ -72,10 +72,6 @@ install_dependencies() {
     fi
     if ! command -v openssl &> /dev/null; then
         log_error "openssl 未安装或安装失败，无法生成随机密码。请手动安装后再运行脚本。"
-    fi
-    # 检查是否有 python3 和 urllib.parse 模块用于 URL 编码
-    if ! command -v python3 &> /dev/null || ! python3 -c "import urllib.parse" &> /dev/null; then
-        log_warn "Python3 或其 urllib.parse 模块未安装，URL 编码可能不完全。请确保安装：apt install python3 / yum install python3."
     fi
     log_info "依赖安装完成。"
 }
@@ -375,43 +371,33 @@ display_config_details() {
 
 # 辅助函数：进行 URL 编码
 url_encode() {
-    # 使用 Python 进行更可靠的 URL 编码
-    python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))" 2>/dev/null
-    # 如果Python编码失败，退回 bash 简单编码（可能不完整）
-    if [ $? -ne 0 ]; then
+    # 优先尝试使用 Python 进行更可靠的 URL 编码
+    if command -v python3 &> /dev/null; then
+        python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))" 2>/dev/null
+    else
+        # 如果Python不存在，退回 bash 简单编码
+        # 注意：此方法可能不完全兼容所有复杂字符和所有客户端
         echo "$1" | xxd -plain | sed 's/\(..\)/%\1/g' | tr -d '\n'
     fi
 }
 
-# 生成 Shadowsocks URI
+# 生成 Shadowsocks URI (退回至兼容性更好的版本)
 generate_ss_uri() {
     local encoded_info="${SS_METHOD_GLOBAL}:${SS_PASSWORD_GLOBAL}@${SS_SERVER_IP_GLOBAL}:${SS_PORT_GLOBAL}"
     local base64_encoded=$(echo -n "$encoded_info" | base64 -w 0) # -w 0 禁用换行
 
     local uri="ss://${base64_encoded}"
-    local params_list=() # 使用数组存储所有参数
+    local params=""
 
     if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
-        # 混淆插件参数 (plugin=obfs)
-        params_list+=("plugin=obfs")
-        
-        # plugin_opts 参数
-        local plugin_opts_value="mode=${SS_OBFS_MODE_GLOBAL}"
-        # 如果是TLS模式，才添加host参数
-        if [ "$SS_OBFS_MODE_GLOBAL" == "tls" ] || [ "$SS_OBFS_MODE_GLOBAL" == "http" ]; then
-            plugin_opts_value+=";host=${SS_OBFS_HOST_GLOBAL}"
-        fi
-        params_list+=("plugin_opts=$(url_encode "$plugin_opts_value")")
-    fi
-
-    # 将所有参数通过 & 符号连接，并添加到 URI
-    if [ ${#params_list[@]} -gt 0 ]; then
-        uri+="?$(IFS="&"; echo "${params_list[*]}")"
+        # 这种格式被许多 Shadowsocks 客户端广泛支持 (如 V2RayN, Clash, Shadowrocket)
+        # 注意：这里混淆参数直接拼接，host 不会二次编码，但其值本身会作为整体编码。
+        params+=";plugin=obfs;obfs-mode=${SS_OBFS_MODE_GLOBAL};obfs-host=$(url_encode "$SS_OBFS_HOST_GLOBAL")"
     fi
 
     # 对节点名称进行 URL 编码，作为 fragment (tag)
     local encoded_node_name=$(url_encode "$NODE_NAME_GLOBAL")
-    uri+="#${encoded_node_name}" 
+    uri+="${params}#${encoded_node_name}" 
 
     log_info "您的 Shadowsocks 客户端连接 URI (点击复制即可导入客户端)："
     echo -e "${YELLOW}${uri}${NC}"
