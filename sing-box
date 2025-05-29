@@ -2,9 +2,10 @@
 
 # Sing-box 一键安装脚本
 # 作者：Ellery
-# 版本：1.5
+# 版本：1.7
 # 日期：2025年5月29日
-# 描述：自动化安装 sing-box 并进行基础配置，支持交互式配置 Shadowsocks 出站代理及内置混淆，密码自动生成，并在结束时显示SS链接。
+# 描述：自动化安装 sing-box 并进行基础配置，支持交互式配置 Shadowsocks 出站代理及内置混淆，密码自动生成，
+#       并在结束时显示SS链接及详细节点信息。
 
 # --- 变量定义 ---
 SINGBOX_VERSION="latest" # 可以指定版本，例如 "1.8.0"
@@ -13,13 +14,15 @@ CONFIG_PATH="/etc/local/sing-box"
 SERVICE_NAME="sing-box"
 DOWNLOAD_URL_BASE="https://github.com/SagerNet/sing-box/releases/download"
 
-# 全局变量，用于存储SS配置信息，以便在脚本结束时生成URI
+# 全局变量，用于存储SS配置信息，以便在脚本结束时生成URI和显示信息
 SS_SERVER_GLOBAL=""
 SS_PORT_GLOBAL=""
 SS_PASSWORD_GLOBAL=""
 SS_METHOD_GLOBAL=""
 SS_OBFS_MODE_GLOBAL="" # http 或 tls
 SS_OBFS_HOST_GLOBAL=""
+NODE_NAME_GLOBAL="" # 用于存储节点名称
+CONFIGURED_SS_OUTBOUND=false # 标记是否配置了SS出站
 
 # --- 颜色定义 ---
 GREEN='\033[0;32m'
@@ -134,13 +137,17 @@ create_config() {
     OBFS_CONFIG="" # 用于存储混淆配置
 
     if [[ "$config_ss_outbound" =~ ^[Yy]$ ]]; then
+        CONFIGURED_SS_OUTBOUND=true # 设置标记为 true
         log_info "请输入 Shadowsocks 出站代理信息："
         read -p "  Shadowsocks 服务器地址 (server, e.g., your.ss.server.com): " ss_server
         read -p "  Shadowsocks 服务器端口 (server_port, e.g., 443): " ss_port
+        read -p "  请输入节点名称 (用于客户端显示, 留空则使用 'SingBox_SS_Auto'): " node_name_input
+        NODE_NAME_GLOBAL=${node_name_input:-SingBox_SS_Auto} # 如果用户未输入，使用默认值
         
         # 自动生成16位密码
         ss_password=$(openssl rand -base64 12 | head -c 16)
-        log_info "  已自动生成 Shadowsocks 密码：${YELLOW}${ss_password}${NC}"
+        # 注意：这里不再立即打印密码，而是在最后统一展示
+        # log_info "  已自动生成 Shadowsocks 密码：${YELLOW}${ss_password}${NC}"
 
         echo "  请选择 Shadowsocks 加密方法 (method):"
         echo "    1) 2022-blake3-aes-128-gcm"
@@ -363,10 +370,30 @@ start_service() {
     log_info "sing-box 服务已成功启动。"
 }
 
+# 显示配置详情
+display_config_details() {
+    if [ "$CONFIGURED_SS_OUTBOUND" = true ]; then
+        echo ""
+        log_info "--- Shadowsocks 节点配置详情 ---"
+        echo -e "${YELLOW}节点名称：  ${NODE_NAME_GLOBAL}${NC}"
+        echo -e "${YELLOW}服务器地址：${SS_SERVER_GLOBAL}${NC}"
+        echo -e "${YELLOW}服务器端口：${SS_PORT_GLOBAL}${NC}"
+        echo -e "${YELLOW}加密方法：  ${SS_METHOD_GLOBAL}${NC}"
+        echo -e "${YELLOW}密码：      ${SS_PASSWORD_GLOBAL}${NC}"
+        if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
+            echo -e "${YELLOW}混淆模式：  ${SS_OBFS_MODE_GLOBAL}${NC}"
+            echo -e "${YELLOW}混淆域名：  ${SS_OBFS_HOST_GLOBAL}${NC}"
+        else
+            echo -e "${YELLOW}混淆：      未启用${NC}"
+        fi
+        echo ""
+    fi
+}
+
 # 生成 Shadowsocks URI
 generate_ss_uri() {
-    if [ -z "$SS_SERVER_GLOBAL" ] || [ -z "$SS_PORT_GLOBAL" ] || [ -z "$SS_PASSWORD_GLOBAL" ] || [ -z "$SS_METHOD_GLOBAL" ]; then
-        return
+    if [ "$CONFIGURED_SS_OUTBOUND" = false ]; then
+        return # 如果没有配置SS出站，则不生成URI
     fi
 
     local encoded_info="${SS_METHOD_GLOBAL}:${SS_PASSWORD_GLOBAL}@${SS_SERVER_GLOBAL}:${SS_PORT_GLOBAL}"
@@ -379,7 +406,9 @@ generate_ss_uri() {
         params+=";plugin=obfs;obfs-mode=${SS_OBFS_MODE_GLOBAL};obfs-host=${SS_OBFS_HOST_GLOBAL}"
     fi
 
-    uri+="${params}#SingBox_SS_Auto" # 可以添加一个Tag，例如服务器的IP或自定义名称
+    # 对节点名称进行 URL 编码
+    local encoded_node_name=$(echo -n "$NODE_NAME_GLOBAL" | xxd -plain | sed 's/\(..\)/%\1/g')
+    uri+="${params}#${encoded_node_name}" 
 
     log_info "您的 Shadowsocks URI (点击复制即可导入客户端)："
     echo -e "${YELLOW}${uri}${NC}"
@@ -398,13 +427,16 @@ main() {
 
     log_info "Sing-box 安装和配置完成！"
     log_info "您可以执行以下命令管理 sing-box 服务："
-    log_info "  启动：systemctl start ${SERVICE_NAME}"
-    log_info "  停止：systemctl stop ${SERVICE_NAME}"
-    log_info "  重启：systemctl restart ${SERVICE_NAME}"
-    log_info "  查看状态：systemctl status ${SERVICE_NAME}"
-    log_info "  查看日志：journalctl -u ${SERVICE_NAME} -f"
+    echo -e "${GREEN}  启动：systemctl start ${SERVICE_NAME}${NC}"
+    echo -e "${GREEN}  停止：systemctl stop ${SERVICE_NAME}${NC}"
+    echo -e "${GREEN}  重启：systemctl restart ${SERVICE_NAME}${NC}"
+    echo -e "${GREEN}  查看状态：systemctl status ${SERVICE_NAME}${NC}"
+    echo -e "${GREEN}  查看日志：journalctl -u ${SERVICE_NAME} -f${NC}"
     
     log_warn "请务必根据您的需求修改配置文件：${CONFIG_PATH}/config.json"
+
+    # 显示详细配置信息
+    display_config_details
 
     # 显示生成的SS链接
     generate_ss_uri
