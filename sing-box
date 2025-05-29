@@ -2,10 +2,10 @@
 
 # Sing-box Shadowsocks 服务端一键安装脚本
 # 作者：Ellery
-# 版本：1.2
+# 版本：1.4
 # 日期：2025年5月29日
 # 描述：自动化安装 sing-box 并配置为 Shadowsocks 服务端，支持内置混淆，自动生成密码，并配置防火墙。
-# 更新：修复 SS 链接生成逻辑，确保混淆参数完整且兼容。
+# 更新：默认混淆方式改为 HTTP 混淆，默认加密方式改为 2022-blake3-aes-128-gcm。
 
 # --- 变量定义 ---
 SINGBOX_VERSION="latest" # 可以指定版本，例如 "1.8.0"
@@ -173,14 +173,14 @@ create_config() {
     SS_PASSWORD_GLOBAL="$ss_password" # 存储到全局变量
 
     echo "请选择 Shadowsocks 加密方法 (method):"
-    echo "  1) 2022-blake3-aes-128-gcm"
+    echo "  1) 2022-blake3-aes-128-gcm (默认)"
     echo "  2) 2022-blake3-aes-256-gcm"
     echo "  3) 2022-blake3-chacha20-poly1305"
     echo "  4) aes-128-gcm"
     echo "  5) aes-256-gcm"
-    echo "  6) chacha20-ietf-poly1305 (推荐)"
-    read -p "选择序号 [6]: " ss_method_choice
-    ss_method_choice=${ss_method_choice:-6}
+    echo "  6) chacha20-ietf-poly1305"
+    read -p "选择序号 [1]: " ss_method_choice # 默认修改为 1
+    ss_method_choice=${ss_method_choice:-1} # 默认值修改为 1
 
     case "$ss_method_choice" in
         1) SS_METHOD_GLOBAL="2022-blake3-aes-128-gcm" ;;
@@ -189,18 +189,18 @@ create_config() {
         4) SS_METHOD_GLOBAL="aes-128-gcm" ;;
         5) SS_METHOD_GLOBAL="aes-256-gcm" ;;
         6) SS_METHOD_GLOBAL="chacha20-ietf-poly1305" ;;
-        *) log_warn "无效的加密方法选择，将使用默认的 chacha20-ietf-poly1305。"
-           SS_METHOD_GLOBAL="chacha20-ietf-poly1305" ;;
+        *) log_warn "无效的加密方法选择，将使用默认的 2022-blake3-aes-128-gcm。"
+           SS_METHOD_GLOBAL="2022-blake3-aes-128-gcm" ;; # 默认值修改为 2022-blake3-aes-128-gcm
     esac
 
     OBFS_CONFIG="" # 用于存储混淆配置
 
     echo "是否启用 Shadowsocks 内置混淆 (需客户端也启用并匹配)？"
     echo "  1) 不启用混淆"
-    echo "  2) HTTP 混淆 (obfs-http)"
+    echo "  2) HTTP 混淆 (obfs-http) (默认)"
     echo "  3) TLS 混淆 (obfs-tls)"
-    read -p "选择序号 [1]: " obfs_choice
-    obfs_choice=${obfs_choice:-1}
+    read -p "选择序号 [2]: " obfs_choice # 默认修改为 2
+    obfs_choice=${obfs_choice:-2} # 默认值修改为 2
 
     if [[ "$obfs_choice" =~ ^[23]$ ]]; then
         read -p "请输入混淆域名 (obfs-host, 默认: www.speedtest.cn): " obfs_host
@@ -376,7 +376,7 @@ display_config_details() {
 # 辅助函数：进行 URL 编码
 url_encode() {
     # 使用 Python 进行更可靠的 URL 编码
-    python3 -c "import urllib.parse; print(urllib.parse.quote('$1'))" 2>/dev/null
+    python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))" 2>/dev/null
     # 如果Python编码失败，退回 bash 简单编码（可能不完整）
     if [ $? -ne 0 ]; then
         echo "$1" | xxd -plain | sed 's/\(..\)/%\1/g' | tr -d '\n'
@@ -389,16 +389,29 @@ generate_ss_uri() {
     local base64_encoded=$(echo -n "$encoded_info" | base64 -w 0) # -w 0 禁用换行
 
     local uri="ss://${base64_encoded}"
-    local params=""
+    local params_list=() # 使用数组存储所有参数
 
     if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
-        local plugin_opts="mode=${SS_OBFS_MODE_GLOBAL};host=$(url_encode "$SS_OBFS_HOST_GLOBAL")"
-        params+=";plugin=obfs;plugin_opts=$(url_encode "$plugin_opts")"
+        # 混淆插件参数 (plugin=obfs)
+        params_list+=("plugin=obfs")
+        
+        # plugin_opts 参数
+        local plugin_opts_value="mode=${SS_OBFS_MODE_GLOBAL}"
+        # 如果是TLS模式，才添加host参数
+        if [ "$SS_OBFS_MODE_GLOBAL" == "tls" ] || [ "$SS_OBFS_MODE_GLOBAL" == "http" ]; then
+            plugin_opts_value+=";host=${SS_OBFS_HOST_GLOBAL}"
+        fi
+        params_list+=("plugin_opts=$(url_encode "$plugin_opts_value")")
     fi
 
-    # 对节点名称进行 URL 编码
+    # 将所有参数通过 & 符号连接，并添加到 URI
+    if [ ${#params_list[@]} -gt 0 ]; then
+        uri+="?$(IFS="&"; echo "${params_list[*]}")"
+    fi
+
+    # 对节点名称进行 URL 编码，作为 fragment (tag)
     local encoded_node_name=$(url_encode "$NODE_NAME_GLOBAL")
-    uri+="${params}#${encoded_node_name}" 
+    uri+="#${encoded_node_name}" 
 
     log_info "您的 Shadowsocks 客户端连接 URI (点击复制即可导入客户端)："
     echo -e "${YELLOW}${uri}${NC}"
