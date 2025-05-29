@@ -1,11 +1,10 @@
 #!/bin/bash
 
-# Sing-box 一键安装脚本
+# Sing-box Shadowsocks 服务端一键安装脚本
 # 作者：Ellery
-# 版本：1.7
+# 版本：1.0
 # 日期：2025年5月29日
-# 描述：自动化安装 sing-box 并进行基础配置，支持交互式配置 Shadowsocks 出站代理及内置混淆，密码自动生成，
-#       并在结束时显示SS链接及详细节点信息。
+# 描述：自动化安装 sing-box 并配置为 Shadowsocks 服务端，支持内置混淆，自动生成密码，并配置防火墙。
 
 # --- 变量定义 ---
 SINGBOX_VERSION="latest" # 可以指定版本，例如 "1.8.0"
@@ -14,15 +13,14 @@ CONFIG_PATH="/etc/local/sing-box"
 SERVICE_NAME="sing-box"
 DOWNLOAD_URL_BASE="https://github.com/SagerNet/sing-box/releases/download"
 
-# 全局变量，用于存储SS配置信息，以便在脚本结束时生成URI和显示信息
-SS_SERVER_GLOBAL=""
+# 全局变量，用于存储服务端配置信息，以便在脚本结束时显示和生成URI
+SS_SERVER_IP_GLOBAL="" # 自动获取或用户输入
 SS_PORT_GLOBAL=""
 SS_PASSWORD_GLOBAL=""
 SS_METHOD_GLOBAL=""
 SS_OBFS_MODE_GLOBAL="" # http 或 tls
-SS_OBFS_HOST_GLOBAL=""
-NODE_NAME_GLOBAL="" # 用于存储节点名称
-CONFIGURED_SS_OUTBOUND=false # 标记是否配置了SS出站
+SS_OBFS_HOST_GLOBAL="" # 用于混淆伪装域名
+NODE_NAME_GLOBAL="" # 用于客户端显示名称
 
 # --- 颜色定义 ---
 GREEN='\033[0;32m'
@@ -65,13 +63,12 @@ detect_os() {
 install_dependencies() {
     log_info "安装依赖..."
     if [ "$OS" == "debian" ]; then
-        apt update -y && apt install -y curl tar gzip systemd openssl -qq
+        apt update -y && apt install -y curl tar gzip systemd openssl ufw -qq
     elif [ "$OS" == "centos" ]; then
-        yum install -y curl tar gzip systemd openssl -q
+        yum install -y curl tar gzip systemd openssl firewalld -q
     else
-        log_warn "未知操作系统，请手动安装 curl, tar, gzip, systemd, openssl。"
+        log_warn "未知操作系统，请手动安装 curl, tar, gzip, systemd, openssl, 以及防火墙软件 (ufw/firewalld)。"
     fi
-    # 检查 openssl 是否安装成功
     if ! command -v openssl &> /dev/null; then
         log_error "openssl 未安装或安装失败，无法生成随机密码。请手动安装后再运行脚本。"
     fi
@@ -125,69 +122,92 @@ download_singbox() {
     log_info "sing-box 下载并安装到 $INSTALL_PATH 成功。"
 }
 
+configure_firewall() {
+    log_info "配置防火墙以允许 Shadowsocks 端口流量..."
+    if [ "$OS" == "debian" ]; then
+        if command -v ufw &> /dev/null; then
+            ufw enable <<< "y" # 自动回答y
+            ufw allow ssh
+            ufw allow "$SS_PORT_GLOBAL"/tcp comment "Allow Sing-box Shadowsocks TCP"
+            ufw allow "$SS_PORT_GLOBAL"/udp comment "Allow Sing-box Shadowsocks UDP"
+            ufw reload
+            log_info "UFW 防火墙配置完成。允许 SSH 和 Shadowsocks 端口 ($SS_PORT_GLOBAL) 流量。"
+        else
+            log_warn "未检测到 UFW，请手动配置防火墙以允许 ${SS_PORT_GLOBAL} 端口的 TCP/UDP 流量。"
+        fi
+    elif [ "$OS" == "centos" ]; then
+        if command -v firewalld &> /dev/null; then
+            systemctl start firewalld
+            systemctl enable firewalld
+            firewall-cmd --permanent --add-port="$SS_PORT_GLOBAL"/tcp --zone=public
+            firewall-cmd --permanent --add-port="$SS_PORT_GLOBAL"/udp --zone=public
+            firewall-cmd --reload
+            log_info "Firewalld 防火墙配置完成。允许 Shadowsocks 端口 ($SS_PORT_GLOBAL) 流量。"
+        else
+            log_warn "未检测到 Firewalld，请手动配置防火墙以允许 ${SS_PORT_GLOBAL} 端口的 TCP/UDP 流量。"
+        fi
+    else
+        log_warn "未知操作系统，请手动配置防火墙以允许 ${SS_PORT_GLOBAL} 端口的 TCP/UDP 流量。"
+    fi
+}
+
 
 create_config() {
-    log_info "创建 sing-box 配置文件..."
+    log_info "创建 sing-box 服务端配置文件..."
     mkdir -p "$CONFIG_PATH"
 
-    read -p "是否配置 Shadowsocks 出站代理？ (y/n) [y]: " config_ss_outbound
-    config_ss_outbound=${config_ss_outbound:-y} # 默认值 y
+    # 询问 Shadowsocks 服务端端口
+    read -p "请输入 Shadowsocks 服务端监听端口 (server_port, e.g., 443): " ss_port
+    SS_PORT_GLOBAL=${ss_port}
+    if [ -z "$SS_PORT_GLOBAL" ]; then
+        log_error "端口不能为空。"
+    fi
 
-    SHADOWSOCKS_OUTBOUND_CONFIG=""
+    # 自动生成16位密码
+    ss_password=$(openssl rand -base64 12 | head -c 16)
+    SS_PASSWORD_GLOBAL="$ss_password" # 存储到全局变量
+
+    echo "请选择 Shadowsocks 加密方法 (method):"
+    echo "  1) 2022-blake3-aes-128-gcm"
+    echo "  2) 2022-blake3-aes-256-gcm"
+    echo "  3) 2022-blake3-chacha20-poly1305"
+    echo "  4) aes-128-gcm"
+    echo "  5) aes-256-gcm"
+    echo "  6) chacha20-ietf-poly1305 (推荐)"
+    read -p "选择序号 [6]: " ss_method_choice
+    ss_method_choice=${ss_method_choice:-6}
+
+    case "$ss_method_choice" in
+        1) SS_METHOD_GLOBAL="2022-blake3-aes-128-gcm" ;;
+        2) SS_METHOD_GLOBAL="2022-blake3-aes-256-gcm" ;;
+        3) SS_METHOD_GLOBAL="2022-blake3-chacha20-poly1305" ;;
+        4) SS_METHOD_GLOBAL="aes-128-gcm" ;;
+        5) SS_METHOD_GLOBAL="aes-256-gcm" ;;
+        6) SS_METHOD_GLOBAL="chacha20-ietf-poly1305" ;;
+        *) log_warn "无效的加密方法选择，将使用默认的 chacha20-ietf-poly1305。"
+           SS_METHOD_GLOBAL="chacha20-ietf-poly1305" ;;
+    esac
+
     OBFS_CONFIG="" # 用于存储混淆配置
 
-    if [[ "$config_ss_outbound" =~ ^[Yy]$ ]]; then
-        CONFIGURED_SS_OUTBOUND=true # 设置标记为 true
-        log_info "请输入 Shadowsocks 出站代理信息："
-        read -p "  Shadowsocks 服务器地址 (server, e.g., your.ss.server.com): " ss_server
-        read -p "  Shadowsocks 服务器端口 (server_port, e.g., 443): " ss_port
-        read -p "  请输入节点名称 (用于客户端显示, 留空则使用 'SingBox_SS_Auto'): " node_name_input
-        NODE_NAME_GLOBAL=${node_name_input:-SingBox_SS_Auto} # 如果用户未输入，使用默认值
-        
-        # 自动生成16位密码
-        ss_password=$(openssl rand -base64 12 | head -c 16)
-        # 注意：这里不再立即打印密码，而是在最后统一展示
-        # log_info "  已自动生成 Shadowsocks 密码：${YELLOW}${ss_password}${NC}"
+    echo "是否启用 Shadowsocks 内置混淆 (需客户端也启用并匹配)？"
+    echo "  1) 不启用混淆"
+    echo "  2) HTTP 混淆 (obfs-http)"
+    echo "  3) TLS 混淆 (obfs-tls)"
+    read -p "选择序号 [1]: " obfs_choice
+    obfs_choice=${obfs_choice:-1}
 
-        echo "  请选择 Shadowsocks 加密方法 (method):"
-        echo "    1) 2022-blake3-aes-128-gcm"
-        echo "    2) 2022-blake3-aes-256-gcm"
-        echo "    3) 2022-blake3-chacha20-poly1305"
-        echo "    4) aes-128-gcm"
-        echo "    5) aes-256-gcm"
-        echo "    6) chacha20-ietf-poly1305 (推荐)"
-        read -p "  选择序号 [6]: " ss_method_choice
-        ss_method_choice=${ss_method_choice:-6}
-
-        case "$ss_method_choice" in
-            1) ss_method="2022-blake3-aes-128-gcm" ;;
-            2) ss_method="2022-blake3-aes-256-gcm" ;;
-            3) ss_method="2022-blake3-chacha20-poly1305" ;;
-            4) ss_method="aes-128-gcm" ;;
-            5) ss_method="aes-256-gcm" ;;
-            6) ss_method="chacha20-ietf-poly1305" ;;
-            *) log_warn "无效的加密方法选择，将使用默认的 chacha20-ietf-poly1305。"
-               ss_method="chacha20-ietf-poly1305" ;;
-        esac
-
-        echo "  是否使用 Shadowsocks 内置混淆？"
-        echo "    1) 不使用混淆"
-        echo "    2) HTTP 混淆 (obfs-http)"
-        echo "    3) TLS 混淆 (obfs-tls)"
-        read -p "  选择序号 [1]: " obfs_choice
-        obfs_choice=${obfs_choice:-1}
-
-        if [[ "$obfs_choice" =~ ^[23]$ ]]; then
-            read -p "  混淆域名 (obfs-host, e.g., www.microsoft.com): " obfs_host
-            if [ -z "$obfs_host" ]; then
-                log_warn "未输入混淆域名，将不配置混淆。"
-                obfs_choice=1 # 强制不配置
-            fi
+    if [[ "$obfs_choice" =~ ^[23]$ ]]; then
+        read -p "请输入混淆域名 (obfs-host, e.g., www.microsoft.com, 必须是真实可访问域名): " obfs_host
+        if [ -z "$obfs_host" ]; then
+            log_warn "未输入混淆域名，将不配置混淆。"
+            obfs_choice=1 # 强制不配置
         fi
+    fi
 
-        case "$obfs_choice" in
-            2) # HTTP Obfs
-                OBFS_CONFIG=$(cat <<EO_OBFS_CONFIG
+    case "$obfs_choice" in
+        2) # HTTP Obfs
+            OBFS_CONFIG=$(cat <<EO_OBFS_CONFIG
       "plugin": "obfs",
       "plugin_opts": {
         "mode": "http",
@@ -195,12 +215,12 @@ create_config() {
       },
 EO_OBFS_CONFIG
 )
-                SS_OBFS_MODE_GLOBAL="http"
-                SS_OBFS_HOST_GLOBAL="$obfs_host"
-                log_info "配置 Shadowsocks HTTP 混淆成功。"
-                ;;
-            3) # TLS Obfs
-                OBFS_CONFIG=$(cat <<EO_OBFS_CONFIG
+            SS_OBFS_MODE_GLOBAL="http"
+            SS_OBFS_HOST_GLOBAL="$obfs_host"
+            log_info "配置 Shadowsocks HTTP 混淆成功。"
+            ;;
+        3) # TLS Obfs
+            OBFS_CONFIG=$(cat <<EO_OBFS_CONFIG
       "plugin": "obfs",
       "plugin_opts": {
         "mode": "tls",
@@ -208,42 +228,29 @@ EO_OBFS_CONFIG
       },
 EO_OBFS_CONFIG
 )
-                SS_OBFS_MODE_GLOBAL="tls"
-                SS_OBFS_HOST_GLOBAL="$obfs_host"
-                log_info "配置 Shadowsocks TLS 混淆成功。"
-                ;;
-            *)
-                log_info "不使用 Shadowsocks 内置混淆。"
-                ;;
-        esac
+            SS_OBFS_MODE_GLOBAL="tls"
+            SS_OBFS_HOST_GLOBAL="$obfs_host"
+            log_info "配置 Shadowsocks TLS 混淆成功。"
+            ;;
+        *)
+            log_info "不使用 Shadowsocks 内置混淆。"
+            ;;
+    esac
 
-        # 检查必填参数（密码现在是自动生成，所以只需要检查服务器地址和端口）
-        if [ -z "$ss_server" ] || [ -z "$ss_port" ]; then
-            log_error "Shadowsocks 服务器地址或端口不完整，将跳过 Shadowsocks 配置。"
-        else
-            SHADOWSOCKS_OUTBOUND_CONFIG=$(cat <<EOCONF
-    {
-      "type": "shadowsocks",
-      "tag": "proxy",
-      "server": "$ss_server",
-      "server_port": $ss_port,
-      "method": "$ss_method",
-      "password": "$ss_password",
-      ${OBFS_CONFIG} # 插入混淆配置
-      "udp_over_tcp": true, # 启用 UDP over TCP，根据需要调整
-      "multiplex": {
-        "enabled": true # 启用 Mux，根据需要调整
-      }
-    }
-EOCONF
-)
-            # 将配置信息存储到全局变量
-            SS_SERVER_GLOBAL="$ss_server"
-            SS_PORT_GLOBAL="$ss_port"
-            SS_PASSWORD_GLOBAL="$ss_password"
-            SS_METHOD_GLOBAL="$ss_method"
+    # 获取服务器公网IP
+    SS_SERVER_IP_GLOBAL=$(curl -sL ipv4.icanhazip.com || curl -sL ip.sb || curl -sL ifconfig.me)
+    if [ -z "$SS_SERVER_IP_GLOBAL" ]; then
+        log_warn "无法自动获取服务器公网IP。请手动输入或确保网络正常。"
+        read -p "请手动输入服务器公网IP: " SS_SERVER_IP_GLOBAL
+        if [ -z "$SS_SERVER_IP_GLOBAL" ]; then
+            log_error "未提供服务器公网IP，无法生成有效配置。"
         fi
     fi
+    log_info "检测到服务器公网IP: ${SS_SERVER_IP_GLOBAL}"
+
+    # 询问节点名称
+    read -p "请输入节点名称 (用于客户端显示, 留空则使用 'SingBox_Server_Auto'): " node_name_input
+    NODE_NAME_GLOBAL=${node_name_input:-SingBox_Server_Auto} # 如果用户未输入，使用默认值
 
     cat <<EOF > "$CONFIG_PATH/config.json"
 {
@@ -252,14 +259,20 @@ EOCONF
   },
   "inbounds": [
     {
-      "type": "mixed",
-      "tag": "mixed-in",
+      "type": "shadowsocks",
+      "tag": "shadowsocks-in",
       "listen": "0.0.0.0",
-      "listen_port": 1080 # 默认监听 SOCKS5 和 HTTP 混合端口
+      "listen_port": $SS_PORT_GLOBAL,
+      "method": "$SS_METHOD_GLOBAL",
+      "password": "$SS_PASSWORD_GLOBAL",
+      ${OBFS_CONFIG} # 插入混淆配置
+      "udp_over_tcp": true, # 服务端通常也需要开启，以便转发客户端的 UDP 流量
+      "multiplex": {
+        "enabled": true # 服务端通常也需要开启 Mux
+      }
     }
   ],
   "outbounds": [
-    ${SHADOWSOCKS_OUTBOUND_CONFIG:+${SHADOWSOCKS_OUTBOUND_CONFIG},} # 如果配置了SS出站，则添加
     {
       "type": "direct",
       "tag": "direct"
@@ -272,43 +285,8 @@ EOCONF
   "route": {
     "rules": [
       {
-        "inbound": ["mixed-in"],
-        "outbound": "proxy" # 将混合入站流量路由到 Shadowsocks 出站
-      },
-      {
-        "rule_set": "geosite-cn",
-        "outbound": "direct"
-      },
-      {
-        "rule_set": "geosite-gfw",
-        "outbound": "proxy"
-      },
-      {
-        "rule_set": "geoip-cn",
-        "outbound": "direct"
-      }
-    ],
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "geosite-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-box-rules@release/rules/geosite-cn.srs",
-        "download_detour": "direct"
-      },
-      {
-        "type": "remote",
-        "tag": "geosite-gfw",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-box-rules@release/rules/geosite-gfw.srs",
-        "download_detour": "direct"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-cn",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-box-rules@release/rules/geoip-cn.srs",
-        "download_detour": "direct"
+        "inbound": ["shadowsocks-in"],
+        "outbound": "direct" # Shadowsocks 服务端通常直接路由到 direct
       }
     ]
   },
@@ -372,37 +350,33 @@ start_service() {
 
 # 显示配置详情
 display_config_details() {
-    if [ "$CONFIGURED_SS_OUTBOUND" = true ]; then
-        echo ""
-        log_info "--- Shadowsocks 节点配置详情 ---"
-        echo -e "${YELLOW}节点名称：  ${NODE_NAME_GLOBAL}${NC}"
-        echo -e "${YELLOW}服务器地址：${SS_SERVER_GLOBAL}${NC}"
-        echo -e "${YELLOW}服务器端口：${SS_PORT_GLOBAL}${NC}"
-        echo -e "${YELLOW}加密方法：  ${SS_METHOD_GLOBAL}${NC}"
-        echo -e "${YELLOW}密码：      ${SS_PASSWORD_GLOBAL}${NC}"
-        if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
-            echo -e "${YELLOW}混淆模式：  ${SS_OBFS_MODE_GLOBAL}${NC}"
-            echo -e "${YELLOW}混淆域名：  ${SS_OBFS_HOST_GLOBAL}${NC}"
-        else
-            echo -e "${YELLOW}混淆：      未启用${NC}"
-        fi
-        echo ""
+    echo ""
+    log_info "--- Shadowsocks 服务端配置详情 ---"
+    echo -e "${YELLOW}节点名称：  ${NODE_NAME_GLOBAL}${NC}"
+    echo -e "${YELLOW}服务器地址：${SS_SERVER_IP_GLOBAL}${NC}"
+    echo -e "${YELLOW}服务器端口：${SS_PORT_GLOBAL}${NC}"
+    echo -e "${YELLOW}加密方法：  ${SS_METHOD_GLOBAL}${NC}"
+    echo -e "${YELLOW}密码：      ${SS_PASSWORD_GLOBAL}${NC}"
+    if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
+        echo -e "${YELLOW}混淆模式：  ${SS_OBFS_MODE_GLOBAL}${NC}"
+        echo -e "${YELLOW}混淆域名：  ${SS_OBFS_HOST_GLOBAL}${NC}"
+    else
+        echo -e "${YELLOW}混淆：      未启用${NC}"
     fi
+    echo ""
 }
 
 # 生成 Shadowsocks URI
 generate_ss_uri() {
-    if [ "$CONFIGURED_SS_OUTBOUND" = false ]; then
-        return # 如果没有配置SS出站，则不生成URI
-    fi
-
-    local encoded_info="${SS_METHOD_GLOBAL}:${SS_PASSWORD_GLOBAL}@${SS_SERVER_GLOBAL}:${SS_PORT_GLOBAL}"
+    local encoded_info="${SS_METHOD_GLOBAL}:${SS_PASSWORD_GLOBAL}@${SS_SERVER_IP_GLOBAL}:${SS_PORT_GLOBAL}"
     local base64_encoded=$(echo -n "$encoded_info" | base64 -w 0) # -w 0 禁用换行
 
     local uri="ss://${base64_encoded}"
     local params=""
 
     if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
+        # 客户端的 obfs plugin 选项在 URI 中可能不同，但这是 sing-box to sing-box 常见的
+        # 这里模拟 simple-obfs 插件的 URI 参数格式
         params+=";plugin=obfs;obfs-mode=${SS_OBFS_MODE_GLOBAL};obfs-host=${SS_OBFS_HOST_GLOBAL}"
     fi
 
@@ -410,7 +384,7 @@ generate_ss_uri() {
     local encoded_node_name=$(echo -n "$NODE_NAME_GLOBAL" | xxd -plain | sed 's/\(..\)/%\1/g')
     uri+="${params}#${encoded_node_name}" 
 
-    log_info "您的 Shadowsocks URI (点击复制即可导入客户端)："
+    log_info "您的 Shadowsocks 客户端连接 URI (点击复制即可导入客户端)："
     echo -e "${YELLOW}${uri}${NC}"
     log_warn "请务必保存此URI，脚本不会再次显示！"
 }
@@ -421,11 +395,12 @@ main() {
     install_dependencies
     get_latest_version
     download_singbox
-    create_config
+    create_config # 创建服务端配置
+    configure_firewall # 配置防火墙
     create_service
     start_service
 
-    log_info "Sing-box 安装和配置完成！"
+    log_info "Sing-box Shadowsocks 服务端安装和配置完成！"
     log_info "您可以执行以下命令管理 sing-box 服务："
     echo -e "${GREEN}  启动：systemctl start ${SERVICE_NAME}${NC}"
     echo -e "${GREEN}  停止：systemctl stop ${SERVICE_NAME}${NC}"
@@ -433,7 +408,7 @@ main() {
     echo -e "${GREEN}  查看状态：systemctl status ${SERVICE_NAME}${NC}"
     echo -e "${GREEN}  查看日志：journalctl -u ${SERVICE_NAME} -f${NC}"
     
-    log_warn "请务必根据您的需求修改配置文件：${CONFIG_PATH}/config.json"
+    log_warn "请务必根据您的需求检查并手动编辑配置文件：${CONFIG_PATH}/config.json"
 
     # 显示详细配置信息
     display_config_details
