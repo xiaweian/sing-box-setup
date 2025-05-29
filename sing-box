@@ -1,0 +1,414 @@
+#!/bin/bash
+
+# Sing-box 一键安装脚本
+# 作者：Ellery
+# 版本：1.5
+# 日期：2025年5月29日
+# 描述：自动化安装 sing-box 并进行基础配置，支持交互式配置 Shadowsocks 出站代理及内置混淆，密码自动生成，并在结束时显示SS链接。
+
+# --- 变量定义 ---
+SINGBOX_VERSION="latest" # 可以指定版本，例如 "1.8.0"
+INSTALL_PATH="/usr/local/sing-box"
+CONFIG_PATH="/etc/local/sing-box"
+SERVICE_NAME="sing-box"
+DOWNLOAD_URL_BASE="https://github.com/SagerNet/sing-box/releases/download"
+
+# 全局变量，用于存储SS配置信息，以便在脚本结束时生成URI
+SS_SERVER_GLOBAL=""
+SS_PORT_GLOBAL=""
+SS_PASSWORD_GLOBAL=""
+SS_METHOD_GLOBAL=""
+SS_OBFS_MODE_GLOBAL="" # http 或 tls
+SS_OBFS_HOST_GLOBAL=""
+
+# --- 颜色定义 ---
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# --- 函数定义 ---
+
+log_info() {
+    echo -e "${GREEN}[信息] $1${NC}"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[警告] $1${NC}"
+}
+
+log_error() {
+    echo -e "${RED}[错误] $1${NC}"
+    exit 1 # 遇到错误即退出
+}
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "请使用 root 用户运行此脚本。"
+    fi
+}
+
+detect_os() {
+    if grep -Eq "debian|ubuntu" /etc/issue || grep -Eq "debian|ubuntu" /etc/*-release; then
+        OS="debian"
+    elif grep -Eq "centos|red hat|fedora" /etc/issue || grep -Eq "centos|red hat|fedora" /etc/*-release; then
+        OS="centos"
+    else
+        OS="unknown"
+    fi
+    log_info "检测到操作系统：$OS"
+}
+
+install_dependencies() {
+    log_info "安装依赖..."
+    if [ "$OS" == "debian" ]; then
+        apt update -y && apt install -y curl tar gzip systemd openssl -qq
+    elif [ "$OS" == "centos" ]; then
+        yum install -y curl tar gzip systemd openssl -q
+    else
+        log_warn "未知操作系统，请手动安装 curl, tar, gzip, systemd, openssl。"
+    fi
+    # 检查 openssl 是否安装成功
+    if ! command -v openssl &> /dev/null; then
+        log_error "openssl 未安装或安装失败，无法生成随机密码。请手动安装后再运行脚本。"
+    fi
+    log_info "依赖安装完成。"
+}
+
+get_latest_version() {
+    log_info "获取最新 sing-box 版本号..."
+    if [ "$SINGBOX_VERSION" == "latest" ]; then
+        VERSION=$(curl -sL https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep "tag_name" | cut -d ':' -f 2 | tr -d '", ' | sed 's/v//')
+        if [ -z "$VERSION" ]; then
+            log_error "无法获取最新 sing-box 版本号，请检查网络或手动指定版本。"
+        fi
+        SINGBOX_VERSION="$VERSION"
+    fi
+    log_info "将安装 sing-box 版本：v${SINGBOX_VERSION}"
+}
+
+download_singbox() {
+    log_info "下载 sing-box v${SINGBOX_VERSION}..."
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        "x86_64") ARCH="amd64" ;;
+        "aarch64") ARCH="arm64" ;;
+        "armv7l") ARCH="armv7" ;;
+        "armv6l") ARCH="armv6" ;;
+        *) log_error "不支持的 CPU 架构：$ARCH" ;;
+    esac
+
+    FILENAME="sing-box-${SINGBOX_VERSION}-linux-${ARCH}.tar.gz"
+    DOWNLOAD_URL="${DOWNLOAD_URL_BASE}/v${SINGBOX_VERSION}/${FILENAME}"
+
+    mkdir -p "$INSTALL_PATH"
+    cd "$INSTALL_PATH" || log_error "无法进入安装目录：$INSTALL_PATH"
+
+    log_info "从 ${DOWNLOAD_URL} 下载..."
+    if ! curl -Lo "$FILENAME" "$DOWNLOAD_URL"; then
+        log_error "下载 sing-box 失败，请检查下载链接或网络。"
+    fi
+
+    tar -xzf "$FILENAME"
+    if [ $? -ne 0 ]; then
+        log_error "解压 sing-box 失败。"
+    fi
+
+    mv "sing-box-${SINGBOX_VERSION}-linux-${ARCH}/sing-box" "$INSTALL_PATH/sing-box" || \
+    mv "sing-box-${SINGBOX_VERSION}-linux-${ARCH}/singbox" "$INSTALL_PATH/sing-box" # 兼容旧版本可能的文件名
+    
+    rm -rf "sing-box-${SINGBOX_VERSION}-linux-${ARCH}" "$FILENAME"
+    chmod +x "$INSTALL_PATH/sing-box"
+    log_info "sing-box 下载并安装到 $INSTALL_PATH 成功。"
+}
+
+
+create_config() {
+    log_info "创建 sing-box 配置文件..."
+    mkdir -p "$CONFIG_PATH"
+
+    read -p "是否配置 Shadowsocks 出站代理？ (y/n) [y]: " config_ss_outbound
+    config_ss_outbound=${config_ss_outbound:-y} # 默认值 y
+
+    SHADOWSOCKS_OUTBOUND_CONFIG=""
+    OBFS_CONFIG="" # 用于存储混淆配置
+
+    if [[ "$config_ss_outbound" =~ ^[Yy]$ ]]; then
+        log_info "请输入 Shadowsocks 出站代理信息："
+        read -p "  Shadowsocks 服务器地址 (server, e.g., your.ss.server.com): " ss_server
+        read -p "  Shadowsocks 服务器端口 (server_port, e.g., 443): " ss_port
+        
+        # 自动生成16位密码
+        ss_password=$(openssl rand -base64 12 | head -c 16)
+        log_info "  已自动生成 Shadowsocks 密码：${YELLOW}${ss_password}${NC}"
+
+        echo "  请选择 Shadowsocks 加密方法 (method):"
+        echo "    1) 2022-blake3-aes-128-gcm"
+        echo "    2) 2022-blake3-aes-256-gcm"
+        echo "    3) 2022-blake3-chacha20-poly1305"
+        echo "    4) aes-128-gcm"
+        echo "    5) aes-256-gcm"
+        echo "    6) chacha20-ietf-poly1305 (推荐)"
+        read -p "  选择序号 [6]: " ss_method_choice
+        ss_method_choice=${ss_method_choice:-6}
+
+        case "$ss_method_choice" in
+            1) ss_method="2022-blake3-aes-128-gcm" ;;
+            2) ss_method="2022-blake3-aes-256-gcm" ;;
+            3) ss_method="2022-blake3-chacha20-poly1305" ;;
+            4) ss_method="aes-128-gcm" ;;
+            5) ss_method="aes-256-gcm" ;;
+            6) ss_method="chacha20-ietf-poly1305" ;;
+            *) log_warn "无效的加密方法选择，将使用默认的 chacha20-ietf-poly1305。"
+               ss_method="chacha20-ietf-poly1305" ;;
+        esac
+
+        echo "  是否使用 Shadowsocks 内置混淆？"
+        echo "    1) 不使用混淆"
+        echo "    2) HTTP 混淆 (obfs-http)"
+        echo "    3) TLS 混淆 (obfs-tls)"
+        read -p "  选择序号 [1]: " obfs_choice
+        obfs_choice=${obfs_choice:-1}
+
+        if [[ "$obfs_choice" =~ ^[23]$ ]]; then
+            read -p "  混淆域名 (obfs-host, e.g., www.microsoft.com): " obfs_host
+            if [ -z "$obfs_host" ]; then
+                log_warn "未输入混淆域名，将不配置混淆。"
+                obfs_choice=1 # 强制不配置
+            fi
+        fi
+
+        case "$obfs_choice" in
+            2) # HTTP Obfs
+                OBFS_CONFIG=$(cat <<EO_OBFS_CONFIG
+      "plugin": "obfs",
+      "plugin_opts": {
+        "mode": "http",
+        "host": "$obfs_host"
+      },
+EO_OBFS_CONFIG
+)
+                SS_OBFS_MODE_GLOBAL="http"
+                SS_OBFS_HOST_GLOBAL="$obfs_host"
+                log_info "配置 Shadowsocks HTTP 混淆成功。"
+                ;;
+            3) # TLS Obfs
+                OBFS_CONFIG=$(cat <<EO_OBFS_CONFIG
+      "plugin": "obfs",
+      "plugin_opts": {
+        "mode": "tls",
+        "host": "$obfs_host"
+      },
+EO_OBFS_CONFIG
+)
+                SS_OBFS_MODE_GLOBAL="tls"
+                SS_OBFS_HOST_GLOBAL="$obfs_host"
+                log_info "配置 Shadowsocks TLS 混淆成功。"
+                ;;
+            *)
+                log_info "不使用 Shadowsocks 内置混淆。"
+                ;;
+        esac
+
+        # 检查必填参数（密码现在是自动生成，所以只需要检查服务器地址和端口）
+        if [ -z "$ss_server" ] || [ -z "$ss_port" ]; then
+            log_error "Shadowsocks 服务器地址或端口不完整，将跳过 Shadowsocks 配置。"
+        else
+            SHADOWSOCKS_OUTBOUND_CONFIG=$(cat <<EOCONF
+    {
+      "type": "shadowsocks",
+      "tag": "proxy",
+      "server": "$ss_server",
+      "server_port": $ss_port,
+      "method": "$ss_method",
+      "password": "$ss_password",
+      ${OBFS_CONFIG} # 插入混淆配置
+      "udp_over_tcp": true, # 启用 UDP over TCP，根据需要调整
+      "multiplex": {
+        "enabled": true # 启用 Mux，根据需要调整
+      }
+    }
+EOCONF
+)
+            # 将配置信息存储到全局变量
+            SS_SERVER_GLOBAL="$ss_server"
+            SS_PORT_GLOBAL="$ss_port"
+            SS_PASSWORD_GLOBAL="$ss_password"
+            SS_METHOD_GLOBAL="$ss_method"
+        fi
+    fi
+
+    cat <<EOF > "$CONFIG_PATH/config.json"
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "listen_port": 1080 # 默认监听 SOCKS5 和 HTTP 混合端口
+    }
+  ],
+  "outbounds": [
+    ${SHADOWSOCKS_OUTBOUND_CONFIG:+${SHADOWSOCKS_OUTBOUND_CONFIG},} # 如果配置了SS出站，则添加
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["mixed-in"],
+        "outbound": "proxy" # 将混合入站流量路由到 Shadowsocks 出站
+      },
+      {
+        "rule_set": "geosite-cn",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geosite-gfw",
+        "outbound": "proxy"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-box-rules@release/rules/geosite-cn.srs",
+        "download_detour": "direct"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-gfw",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-box-rules@release/rules/geosite-gfw.srs",
+        "download_detour": "direct"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-box-rules@release/rules/geoip-cn.srs",
+        "download_detour": "direct"
+      }
+    ]
+  },
+  "dns": {
+    "servers": [
+      {
+        "address": "8.8.8.8",
+        "detour": "direct"
+      },
+      {
+        "address": "1.1.1.1",
+        "detour": "direct"
+      }
+    ]
+  }
+}
+EOF
+    if [ $? -ne 0 ]; then
+        log_error "创建配置文件失败。"
+    fi
+    log_info "配置文件 ${CONFIG_PATH}/config.json 已创建。"
+    log_warn "请务必检查并根据您的需求编辑 ${CONFIG_PATH}/config.json！"
+}
+
+create_service() {
+    log_info "创建 sing-box systemd 服务..."
+    cat <<EOF > "/etc/systemd/system/${SERVICE_NAME}.service"
+[Unit]
+Description=Sing-box Service
+After=network.target
+
+[Service]
+ExecStart=${INSTALL_PATH}/sing-box run -c ${CONFIG_PATH}/config.json
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    if [ $? -ne 0 ]; then
+        log_error "创建 systemd 服务失败。"
+    fi
+
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME"
+    if [ $? -ne 0 ]; then
+        log_error "启用 sing-box 服务失败。"
+    fi
+    log_info "sing-box systemd 服务已创建并设置为开机自启。"
+}
+
+start_service() {
+    log_info "启动 sing-box 服务..."
+    systemctl start "$SERVICE_NAME"
+    if [ $? -ne 0 ]; then
+        log_error "启动 sing-box 服务失败，请检查日志：journalctl -u ${SERVICE_NAME} -f"
+    fi
+    log_info "sing-box 服务已成功启动。"
+}
+
+# 生成 Shadowsocks URI
+generate_ss_uri() {
+    if [ -z "$SS_SERVER_GLOBAL" ] || [ -z "$SS_PORT_GLOBAL" ] || [ -z "$SS_PASSWORD_GLOBAL" ] || [ -z "$SS_METHOD_GLOBAL" ]; then
+        return
+    fi
+
+    local encoded_info="${SS_METHOD_GLOBAL}:${SS_PASSWORD_GLOBAL}@${SS_SERVER_GLOBAL}:${SS_PORT_GLOBAL}"
+    local base64_encoded=$(echo -n "$encoded_info" | base64 -w 0) # -w 0 禁用换行
+
+    local uri="ss://${base64_encoded}"
+    local params=""
+
+    if [ -n "$SS_OBFS_MODE_GLOBAL" ] && [ -n "$SS_OBFS_HOST_GLOBAL" ]; then
+        params+=";plugin=obfs;obfs-mode=${SS_OBFS_MODE_GLOBAL};obfs-host=${SS_OBFS_HOST_GLOBAL}"
+    fi
+
+    uri+="${params}#SingBox_SS_Auto" # 可以添加一个Tag，例如服务器的IP或自定义名称
+
+    log_info "您的 Shadowsocks URI (点击复制即可导入客户端)："
+    echo -e "${YELLOW}${uri}${NC}"
+    log_warn "请务必保存此URI，脚本不会再次显示！"
+}
+
+main() {
+    check_root
+    detect_os
+    install_dependencies
+    get_latest_version
+    download_singbox
+    create_config
+    create_service
+    start_service
+
+    log_info "Sing-box 安装和配置完成！"
+    log_info "您可以执行以下命令管理 sing-box 服务："
+    log_info "  启动：systemctl start ${SERVICE_NAME}"
+    log_info "  停止：systemctl stop ${SERVICE_NAME}"
+    log_info "  重启：systemctl restart ${SERVICE_NAME}"
+    log_info "  查看状态：systemctl status ${SERVICE_NAME}"
+    log_info "  查看日志：journalctl -u ${SERVICE_NAME} -f"
+    
+    log_warn "请务必根据您的需求修改配置文件：${CONFIG_PATH}/config.json"
+
+    # 显示生成的SS链接
+    generate_ss_uri
+}
+
+# --- 执行主函数 ---
+main "$@"
